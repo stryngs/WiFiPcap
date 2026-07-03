@@ -139,6 +139,7 @@ def parseArgs():
     parser.add_argument('--port', '-p', required=False, default=None, help=f'Full device path for USB CDC device connected to {esp32_name}.')
     parser.add_argument('--zc', dest='channel', type=int, choices=range(1, 15), required=False, default=None, help=argparse.SUPPRESS)   # debug
     parser.add_argument('--testing', '--test', '-t', action='store_true', default=None, help="Test run - It does everything but start Wireshark.")
+    parser.add_argument('--gui', action='store_true', default=False, help='Start a small Tkinter control window instead of launching capture immediately.')
 
 
     group2 = parser.add_mutually_exclusive_group(required=False)
@@ -314,6 +315,13 @@ def pickPort():
 def connectESP32(port, channel, filter, unicast, multicast, time_sync):
     global bpsRate
 
+    def serialLineText(line):
+        """
+        Serial diagnostics can contain arbitrary bytes before the PCAP stream
+        starts; keep the handshake log printable without hiding bad bytes.
+        """
+        return line.rstrip(b'\r\n').decode(errors='backslashreplace')
+
     retry = 3
     canBreak = False
     while not canBreak:
@@ -351,7 +359,10 @@ def connectESP32(port, channel, filter, unicast, multicast, time_sync):
             print("[!] Serial port connection closed/failed while reading port!")
             return None
 
-        print(f'[>] ESP32 -> "{line.decode()[:-1]}"')
+        # Old decode() could fail on non-UTF-8 serial noise; serialLineText()
+        # strips line endings and escapes undecodable bytes for safe logging.
+        # print(f'[>] ESP32 -> "{line.decode()[:-1]}"')
+        print(f'[>] ESP32 -> "{serialLineText(line)}"')
         if b"<<SerialPcap>>" in line:
             print("[+] Uploading options ...")
             break
@@ -368,6 +379,10 @@ def connectESP32(port, channel, filter, unicast, multicast, time_sync):
     if filter[1] != None:                   # custome filter
         val = 0x0FFFF & (filter[1] >> 16)   #   only uses the upper 16 bits.
         str += f'S{val}'
+    elif filter[0] != None:
+        # Firmware preserves custom filter state unless an S command is sent.
+        # Clear it when this run only requests SDK-level filtering.
+        str += 'S0'
 
     if unicast:
         str += f'U{unicast[0]}u{unicast[1]}'
@@ -399,22 +414,55 @@ def connectESP32(port, channel, filter, unicast, multicast, time_sync):
             print("[!] Serial port connection closed/failed while reading port!")
             return None
 
-        print(f'[>] ESP32 -> "{line.decode()[:-1]}"')
+        # print(f'[>] ESP32 -> "{line.decode()[:-1]}"')
+        print(f'[>] ESP32 -> "{serialLineText(line)}"')
         if b"<<PASSTHROUGH>>" in line:
             print("[+] Upload Complete ...")
             break
 
     print("[+] Stream started ...")
+    # Use a short read timeout so the relay loop can notice Wireshark exit and
+    # return to the cleanup path that sends EOT back to the ESP32.
+    ser.timeout = 0.05
     return ser
 
 
 def runWireshark(ser):
+    """
+        # Old path gave Wireshark the serial port directly, leaving Python mostly
+        # waiting in communicate(). Keep Python in the relay loop so it can detect
+        # Wireshark exit and send EOT to the ESP32 during cleanup.
+
+        print("[+] Starting Wireshark ...")
+        proc=subprocess.Popen([ wireshark_path, '-k', '-i', '-' ], stdin=ser)
+        proc.communicate()
+        # cmd='wireshark -k -i -'
+        # proc=subprocess.Popen(shlex.split(cmd), stdin=ser, start_new_session=True)
+        # proc=subprocess.Popen(shlex.split(cmd), stdin=ser)
+    """
     print("[+] Starting Wireshark ...")
-    proc=subprocess.Popen([ wireshark_path, '-k', '-i', '-' ], stdin=ser)
-    proc.communicate()
-    # cmd='wireshark -k -i -'
-    # proc=subprocess.Popen(shlex.split(cmd), stdin=ser, start_new_session=True)
-    # proc=subprocess.Popen(shlex.split(cmd), stdin=ser)
+    # Keep Python in the middle instead of handing the serial object directly to
+    # Wireshark, so this script can detect process exit and close the ESP32 side.
+    proc=subprocess.Popen([ wireshark_path, '-k', '-i', '-' ], stdin=subprocess.PIPE)
+    try:
+        while ser.is_open and proc.poll() is None:
+            data = ser.read(4096)
+            if not data:
+                continue
+            try:
+                proc.stdin.write(data)
+                proc.stdin.flush()
+            except BrokenPipeError:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        proc.wait()
 
 
 def runWiresharkWin32(ser):
@@ -481,11 +529,247 @@ def processAddress(unicast, oui):
     return [ msb, lsb ]
 
 
+def runTkinterGui(args):
+    """
+    Small desktop control surface for esp32shark.py.
+
+    First pass intentionally launches this same script as a child process instead
+    of duplicating the serial/Wireshark relay in Tkinter callbacks. That keeps
+    the proven CLI path as the single source of truth while giving us a place to
+    grow controls.
+
+    Live channel/filter changes while Wireshark stays open will need firmware
+    support for a sideband control command. The current serial protocol
+    re-enters the PCAP handshake and sends a new PCAP file header, which should
+    not be injected into one already-running Wireshark stdin stream.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+        from tkinter import messagebox
+    except Exception as ex:
+        print(f"[!] Tkinter is not available: {ex}")
+        return 1
+
+    class Esp32SharkGui:
+        def __init__(self, root):
+            self.root = root
+            self.proc = None
+            self.reader_thread = None
+
+            root.title(f"{esp32_name} coPilot")
+            root.geometry("720x520")
+            root.minsize(620, 460)
+
+            self.port_var = tk.StringVar()
+            self.channel_var = tk.IntVar(value=args.channel if args.channel else 6)
+            self.filter_var = tk.StringVar(value="Session")
+            self.time_sync_var = tk.BooleanVar(value=args.time_sync)
+            self.status_var = tk.StringVar(value="Idle")
+
+            self.build_widgets()
+            self.refresh_ports()
+
+        def build_widgets(self):
+            outer = ttk.Frame(self.root, padding=14)
+            outer.pack(fill=tk.BOTH, expand=True)
+
+            title = ttk.Label(outer, text=f"{esp32_name} coPilot", font=("TkDefaultFont", 18, "bold"))
+            title.pack(anchor=tk.W)
+
+            subtitle = ttk.Label(
+                outer,
+                text="USB/Wireshark launcher with simple capture controls. Apply changes by restarting capture.",
+                foreground="#666666")
+            subtitle.pack(anchor=tk.W, pady=(2, 14))
+
+            controls = ttk.LabelFrame(outer, text="Capture")
+            controls.pack(fill=tk.X)
+
+            ttk.Label(controls, text="Serial port").grid(row=0, column=0, sticky=tk.W, padx=8, pady=8)
+            self.port_box = ttk.Combobox(controls, textvariable=self.port_var, state="readonly", width=34)
+            self.port_box.grid(row=0, column=1, sticky=tk.EW, padx=8, pady=8)
+            ttk.Button(controls, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=8, pady=8)
+
+            ttk.Label(controls, text="Channel").grid(row=1, column=0, sticky=tk.W, padx=8, pady=8)
+            channel_spin = ttk.Spinbox(controls, from_=1, to=max_channel, textvariable=self.channel_var, width=8)
+            channel_spin.grid(row=1, column=1, sticky=tk.W, padx=8, pady=8)
+
+            ttk.Label(controls, text="Filter").grid(row=2, column=0, sticky=tk.W, padx=8, pady=8)
+            self.filter_box = ttk.Combobox(
+                controls,
+                textvariable=self.filter_var,
+                state="readonly",
+                values=("Previous", "Session", "Good", "All", "Mgmt + Data", "Bad FCS"))
+            self.filter_box.grid(row=2, column=1, sticky=tk.EW, padx=8, pady=8)
+
+            ttk.Checkbutton(controls, text="Sync PCAP start time from this computer", variable=self.time_sync_var).grid(
+                row=3, column=0, columnspan=3, sticky=tk.W, padx=8, pady=8)
+
+            controls.columnconfigure(1, weight=1)
+
+            actions = ttk.Frame(outer)
+            actions.pack(fill=tk.X, pady=12)
+            self.start_button = ttk.Button(actions, text="Start Wireshark", command=self.start_capture)
+            self.start_button.pack(side=tk.LEFT)
+            self.stop_button = ttk.Button(actions, text="Stop", command=self.stop_capture, state=tk.DISABLED)
+            self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
+            ttk.Label(actions, textvariable=self.status_var).pack(side=tk.RIGHT)
+
+            note = ttk.Label(
+                outer,
+                text="Changing controls during capture does not affect the running stream yet. Stop and Start to apply.",
+                foreground="#884400")
+            note.pack(anchor=tk.W, pady=(0, 8))
+
+            log_frame = ttk.LabelFrame(outer, text="Log")
+            log_frame.pack(fill=tk.BOTH, expand=True)
+            self.log_text = tk.Text(log_frame, height=14, wrap=tk.WORD)
+            self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+            scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            self.log_text.configure(yscrollcommand=scroll.set)
+
+            self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+        def log(self, message):
+            self.log_text.insert(tk.END, message.rstrip() + "\n")
+            self.log_text.see(tk.END)
+
+        def refresh_ports(self):
+            ports = sorted(serial.tools.list_ports.comports())
+            labels = [port.device for port in ports]
+            self.port_box["values"] = labels
+
+            if args.port and args.port in labels:
+                self.port_var.set(args.port)
+            elif labels and not self.port_var.get():
+                self.port_var.set(labels[0])
+
+            self.log("Ports: " + (", ".join(labels) if labels else "none found"))
+
+        def filter_args(self):
+            selected = self.filter_var.get()
+            if selected == "Previous":
+                return []
+            if selected == "Session":
+                return ["--filter_session"]
+            if selected == "Good":
+                return ["--filter_good"]
+            if selected == "All":
+                return ["--filter_all"]
+            if selected == "Mgmt + Data":
+                return ["--filter_mask", "mgmt|data"]
+            if selected == "Bad FCS":
+                return ["--filter_mask", "bad"]
+            return []
+
+        def build_command(self):
+            port = self.port_var.get()
+            if not port:
+                messagebox.showwarning("No Port", "Select a serial port first.")
+                return None
+
+            command = [
+                sys.executable,
+                os.path.abspath(__file__),
+                "--port", port,
+                "--channel", str(self.channel_var.get())
+            ]
+
+            command.extend(self.filter_args())
+
+            if not self.time_sync_var.get():
+                command.append("--no_time_sync")
+
+            return command
+
+        def start_capture(self):
+            if self.proc and self.proc.poll() is None:
+                self.log("Capture is already running.")
+                return
+
+            command = self.build_command()
+            if not command:
+                return
+
+            self.log("[GUI] Starting: " + " ".join(shlex.quote(part) for part in command))
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            self.proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env)
+
+            self.status_var.set("Running")
+            self.start_button.configure(state=tk.DISABLED)
+            self.stop_button.configure(state=tk.NORMAL)
+            self.reader_thread = None
+
+            # Tkinter widgets must only be updated on the GUI thread. The reader
+            # thread hands each line back to root.after().
+            import threading
+            self.reader_thread = threading.Thread(target=self.read_child_output, daemon=True)
+            self.reader_thread.start()
+
+        def read_child_output(self):
+            try:
+                for line in self.proc.stdout:
+                    self.root.after(0, self.log, line)
+            except Exception as ex:
+                self.root.after(0, self.log, f"[GUI] Reader stopped: {ex}")
+            finally:
+                self.root.after(0, self.child_finished)
+
+        def child_finished(self):
+            if self.proc and self.proc.poll() is None:
+                return
+
+            self.status_var.set("Idle")
+            self.start_button.configure(state=tk.NORMAL)
+            self.stop_button.configure(state=tk.DISABLED)
+
+        def stop_capture(self):
+            if not self.proc or self.proc.poll() is not None:
+                self.child_finished()
+                return
+
+            self.log("[GUI] Stopping capture ...")
+            try:
+                # SIGINT gives the child script a chance to send EOT to the ESP32
+                # and close the serial port cleanly.
+                self.proc.send_signal(signal.SIGINT)
+                self.root.after(2500, self.force_stop_if_needed)
+            except Exception as ex:
+                self.log(f"[GUI] Stop failed: {ex}")
+
+        def force_stop_if_needed(self):
+            if self.proc and self.proc.poll() is None:
+                self.log("[GUI] Capture did not stop cleanly; terminating child process.")
+                self.proc.terminate()
+
+        def close(self):
+            self.stop_capture()
+            self.root.after(300, self.root.destroy)
+
+    root = tk.Tk()
+    Esp32SharkGui(root)
+    root.mainloop()
+    return 0
+
+
 def main():
     default_encoding = get_encoding()
 
     try:
         args = parseArgs()
+
+        if args.gui:
+            return runTkinterGui(args)
+
         if args.no_addr:
             unicast = [0, 0]
             multicast = None

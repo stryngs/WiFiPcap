@@ -114,7 +114,13 @@ typedef enum {
     PCAP_LINK_TYPE_BSD_SLIP = 102,     // BSD/OS SLIP
     PCAP_LINK_TYPE_BSD_PPP = 103,      // BSD/OS PPP
     PCAP_LINK_TYPE_CISCO_HDLC = 104,   // Cisco HDLC
-    PCAP_LINK_TYPE_802_11 = 105,       // 802.11
+    // Original:
+    // PCAP_LINK_TYPE_802_11 = 105,       // 802.11
+    // PCAP_LINK_TYPE_BSD_LOOPBACK = 108, // OpenBSD loopback devices(with AF_value in network byte order)
+    PCAP_LINK_TYPE_802_11 = 105,       // 802.11 without radio metadata
+    // Radiotap uses a distinct link type because each packet starts with a
+    // Radiotap metadata header before the 802.11 frame.
+    PCAP_LINK_TYPE_IEEE802_11_RADIOTAP = 127, // 802.11 plus Radiotap metadata
     PCAP_LINK_TYPE_BSD_LOOPBACK = 108, // OpenBSD loopback devices(with AF_value in network byte order)
     PCAP_LINK_TYPE_LOCAL_TALK = 114    // LocalTalk
 } pcap_link_type_t;

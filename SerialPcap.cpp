@@ -30,6 +30,9 @@
 #include <esp_wifi.h>
 // #include <hal/usb_serial_jtag_ll.h>
 #include "SerialPcap.h"
+// Added for synthetic Radiotap headers that carry ESP32 RX metadata, such as
+// RSSI, before each 802.11 frame in the PCAP stream.
+#include "Radiotap.h"
 #include "WiFiPcap.h"
 #include "Interlocks.h"
 
@@ -37,7 +40,15 @@
 #define USE_WIFIPCAP_FILTER_AP_SESSION 0
 #endif
 
-#if ! ARDUINO_USB_CDC_ON_BOOT && ! ARDUINO_USB_MODE
+// #if ! ARDUINO_USB_CDC_ON_BOOT && ! ARDUINO_USB_MODE
+// USBCDC USBSerial(0);
+// #endif
+
+// When USB CDC is not provided by Serial-on-boot, create the matching global
+// USBSerial object for the selected Arduino USB backend.
+#if ! ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+HWCDC USBSerial;
+#elif ! ARDUINO_USB_CDC_ON_BOOT && ! ARDUINO_USB_MODE
 USBCDC USBSerial(0);
 #endif
 
@@ -91,7 +102,10 @@ struct SerialTask {
     TaskState volatile state;
     uint32_t channel = 0;
     SERIAL_INF* volatile pcapSerial = NULL;
-    TaskHandle_t volatile task = NULL;
+    // TaskHandle_t volatile task = NULL;
+    // FreeRTOS task creation writes the handle through TaskHandle_t *; keep the
+    // handle itself non-volatile so it can be passed without a type cast.
+    TaskHandle_t task = NULL;
     QueueHandle_t volatile work_queue = NULL;
 
     // Track time rollover, takes ~1.193046 hours
@@ -348,12 +362,29 @@ static bool isTxHang(SerialTask *session) {
 static inline bool isTxHang(SerialTask *session) { return false; }
 #endif
 
+// HWCDC does not provide a reliable DTR disconnect indication. The host script
+// sends EOT when closing, so poll RX while streaming and treat it as DTR LOW.
+static bool checkRxAbort(SerialTask *session) {
+    while (0 < session->pcapSerial->available()) {
+        if ('\x04' == session->pcapSerial->read()) {
+            ESP_LOGE(TAG, "Write PCAP RX EOT - Abort!");
+            serial_pcap_notifyDtrRts(false, false);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool writeWait(SerialTask *session, const void *data, const size_t total_length) {
     static bool nodelay = true;
     const uint8_t *pb = (const uint8_t *)data;
     ssize_t remaining = total_length;
     ssize_t wrote = 0;
     while (remaining) {
+        // Check for host EOT before each write attempt so a clean shutdown is
+        // noticed even while USB TX continues to make progress.
+        if (checkRxAbort(session)) return false;
+
         wrote = session->pcapSerial->write(pb, remaining);
         if (0 <= wrote) {
             remaining -= wrote;
@@ -368,13 +399,17 @@ bool writeWait(SerialTask *session, const void *data, const size_t total_length)
                 nodelay = false;
 #if 1 //ARDUINO_USB_MODE
                 if (isTxHang(session)) return false;
-                // HWCDC does not support DTR so we rely on the script send an
-                // EOT when closing serial. On EOT, simulate a DTR LOW event.
-                if ('\x04' == session->pcapSerial->read()) {
-                    ESP_LOGE(TAG, "Write PCAP RX EOT - Abort!");
-                    serial_pcap_notifyDtrRts(false, false);
-                    return false;
-                }
+
+                // EOT handling moved to checkRxAbort() at the top of the write
+                // loop so host shutdown is detected even when writes keep succeeding.
+
+                // // HWCDC does not support DTR so we rely on the script send an
+                // // EOT when closing serial. On EOT, simulate a DTR LOW event.
+                // if ('\x04' == session->pcapSerial->read()) {
+                //     ESP_LOGE(TAG, "Write PCAP RX EOT - Abort!");
+                //     serial_pcap_notifyDtrRts(false, false);
+                //     return false;
+                // }
 #endif
             } else {
                 nodelay = true;
@@ -415,7 +450,15 @@ bool writePcapWait(SerialTask *session, const WiFiPcap *wpcap) {
 const uint8_t k_llc_snap_hdr[] = { 0xAAu, 0xAAu, 0x03u, 0x00, 0x00, 0x00 };
 
 static void cache_authenticate(WiFiPcap *wpcap) {
-    const WiFiPktHdr* const pkt = (WiFiPktHdr*)wpcap->payload;
+    // Original:
+    // const WiFiPktHdr* const pkt = (WiFiPktHdr*)wpcap->payload;
+    //
+    // PCAP payload now starts with Radiotap, so skip that header before
+    // inspecting the 802.11 frame for authentication packets.
+    const RadiotapHeader * const rtap = (RadiotapHeader*)wpcap->payload;
+    const size_t dot11_offset = rtap->length;
+    if (wpcap->pcap_header.capture_length <= dot11_offset) return;
+    const WiFiPktHdr* const pkt = (WiFiPktHdr*)&wpcap->payload[dot11_offset];
     if (0 == cust_fltr.cache_auth) return;
     // Rapid disqualifier
     size_t len = offsetof(struct WiFiPktHdr, addr4);
@@ -424,7 +467,12 @@ static void cache_authenticate(WiFiPcap *wpcap) {
         WLAN_FC_STYPE_QOS_DATA == pkt->fctl.subtype) qos_len = sizeof(QOS_CNTRL);
 
     len += sizeof(LLC) + qos_len;
-    if (wpcap->pcap_header.capture_length <= len) return;
+    // Original:
+    // if (wpcap->pcap_header.capture_length <= len) return;
+    //
+    // capture_length includes Radiotap, but len is measured inside the 802.11
+    // frame. Include the Radiotap offset when validating packet bounds.
+    if (wpcap->pcap_header.capture_length <= (dot11_offset + len)) return;
 
     const LLC * const llc = (LLC*)((uintptr_t)pkt->addr4.mac + qos_len);
     if (k_802_1x_authentication != llc->type) return;
@@ -557,6 +605,16 @@ esp_err_t pcap_serial_start(SerialTask *session, pcap_link_type_t link_type) {
 
     begin_promiscuous(channel, filter, filter);
 
+    // Original:
+    // .snaplen = PCAP_MAX_CAPTURE_PACKET_SIZE,  // MAX length of captured packets, in octets
+    //
+    // Radiotap packets include metadata before the 802.11 frame, so the file
+    // snaplen must include those extra bytes when using the Radiotap link type.
+    const uint32_t snaplen =
+        (PCAP_LINK_TYPE_IEEE802_11_RADIOTAP == link_type)
+        ? (PCAP_MAX_CAPTURE_PACKET_SIZE + RADIOTAP_BASIC_LENGTH)
+        : PCAP_MAX_CAPTURE_PACKET_SIZE;
+
     // Write Pcap File header - About PCAP_MAGIC, The decoder will use it to
     // detect if byte swapping is needed when interpreting the results. No need
     // for extra care in constructing byteswapped headers.
@@ -566,7 +624,7 @@ esp_err_t pcap_serial_start(SerialTask *session, pcap_link_type_t link_type) {
         .minor = PCAP_DEFAULT_VERSION_MINOR,      //
         .zone  = PCAP_DEFAULT_TIME_ZONE_GMT,      // Most implementations set tp 0
         .sigfigs = 0,                             // accuracy of timestamps, ditto above
-        .snaplen = PCAP_MAX_CAPTURE_PACKET_SIZE,  // MAX length of captured packets, in octets
+        .snaplen = snaplen,                       // MAX length of captured packets, in octets
         .link_type = link_type
     };
 
@@ -709,7 +767,12 @@ static void serial_task(void *parameters) {
                 free(wpcap);
                 wpcap = NULL;
             }
-            need_resync = (ESP_OK != pcap_serial_start(session, PCAP_LINK_TYPE_802_11));
+            // Original:
+            // need_resync = (ESP_OK != pcap_serial_start(session, PCAP_LINK_TYPE_802_11));
+            //
+            // The payload now starts with a Radiotap header before Dot11 bytes,
+            // so advertise the Radiotap link type in the PCAP file header.
+            need_resync = (ESP_OK != pcap_serial_start(session, PCAP_LINK_TYPE_IEEE802_11_RADIOTAP));
             // Clear queue so we can get time synced properly with host
             while (pdTRUE == xQueueReceive(session->work_queue, &wpcap, 0)) {
                 cache_authenticate(wpcap);
@@ -795,6 +858,86 @@ static void serial_task(void *parameters) {
 //
 #pragma GCC push_options
 #pragma GCC optimize("Ofast")
+
+// Radiotap's Rate field is in 500 kb/s units. ESP32 only marks rx_ctrl.rate
+// valid for non-HT 11b/g packets, so return 0 when an MCS-specific Radiotap
+// field would be needed instead.
+static uint8_t radiotap_rate_500kbps(const wifi_pkt_rx_ctrl_t *rx_ctrl) {
+    if (0 != rx_ctrl->sig_mode) return 0;
+
+    switch (rx_ctrl->rate) {
+        case WIFI_PHY_RATE_1M_L:  return 2u;
+        case WIFI_PHY_RATE_2M_L:
+        case WIFI_PHY_RATE_2M_S:  return 4u;
+        case WIFI_PHY_RATE_5M_L:
+        case WIFI_PHY_RATE_5M_S:  return 11u;
+        case WIFI_PHY_RATE_11M_L:
+        case WIFI_PHY_RATE_11M_S: return 22u;
+        case WIFI_PHY_RATE_6M:    return 12u;
+        case WIFI_PHY_RATE_9M:    return 18u;
+        case WIFI_PHY_RATE_12M:   return 24u;
+        case WIFI_PHY_RATE_18M:   return 36u;
+        case WIFI_PHY_RATE_24M:   return 48u;
+        case WIFI_PHY_RATE_36M:   return 72u;
+        case WIFI_PHY_RATE_48M:   return 96u;
+        case WIFI_PHY_RATE_54M:   return 108u;
+        default:                  return 0u;
+    }
+}
+
+// Channel flags need to distinguish 2.4 GHz CCK rates from OFDM rates. HT
+// packets are left as OFDM-like for now until an MCS Radiotap field is emitted.
+static bool radiotap_is_cck_rate(const wifi_pkt_rx_ctrl_t *rx_ctrl) {
+    if (0 != rx_ctrl->sig_mode) return false;
+
+    switch (rx_ctrl->rate) {
+        case WIFI_PHY_RATE_1M_L:
+        case WIFI_PHY_RATE_2M_L:
+        case WIFI_PHY_RATE_2M_S:
+        case WIFI_PHY_RATE_5M_L:
+        case WIFI_PHY_RATE_5M_S:
+        case WIFI_PHY_RATE_11M_L:
+        case WIFI_PHY_RATE_11M_S:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static uint8_t radiotap_packet_flags(const wifi_pkt_rx_ctrl_t *rx_ctrl, bool include_fcs) {
+    uint8_t flags = include_fcs ? RADIOTAP_F_FCS : 0u;
+
+    // Short preamble only applies to the legacy 2/5.5/11 Mbps CCK encodings.
+    if (0 == rx_ctrl->sig_mode) {
+        switch (rx_ctrl->rate) {
+            case WIFI_PHY_RATE_2M_S:
+            case WIFI_PHY_RATE_5M_S:
+            case WIFI_PHY_RATE_11M_S:
+                flags |= RADIOTAP_F_SHORTPRE;
+                break;
+            default:
+                break;
+        }
+    }
+    return flags;
+}
+
+static void fillRadiotapHeader(RadiotapHeaderBasic *rtap, const wifi_pkt_rx_ctrl_t *rx_ctrl, bool include_fcs) {
+    // Build the fixed first-pass Radiotap header immediately before copying the
+    // 802.11 bytes, making the packet parse as RadioTap / Dot11 in readers.
+    rtap->hdr.version = RADIOTAP_VERSION;
+    rtap->hdr.pad = 0;
+    rtap->hdr.length = RADIOTAP_BASIC_LENGTH;
+    rtap->hdr.present = RADIOTAP_BASIC_PRESENT;
+    rtap->flags = radiotap_packet_flags(rx_ctrl, include_fcs);
+    rtap->rate = radiotap_rate_500kbps(rx_ctrl);
+    rtap->channel.frequency = radiotap_channel_frequency_2ghz(rx_ctrl->channel);
+    rtap->channel.flags = radiotap_channel_flags_2ghz(radiotap_is_cck_rate(rx_ctrl));
+    rtap->dbm_antsignal = rx_ctrl->rssi;
+    rtap->dbm_antnoise = rx_ctrl->noise_floor;
+    rtap->antenna = rx_ctrl->ant;
+}
+
 esp_err_t serial_pcap_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type) {
     wifi_promiscuous_pkt_t *snoop = (wifi_promiscuous_pkt_t *)recv_buf;
     SerialTask *session = &st;
@@ -893,10 +1036,23 @@ esp_err_t serial_pcap_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type) {
         if (keepLength > 0) {
             // This may need to use PSRAM
             // Use work_queue size as a limiter on total memory allocated.wpcap->payload / 1000000u;
-            WiFiPcap *wpcap = (WiFiPcap*)malloc(keepLength + sizeof(WiFiPcap));
+            // Original:
+            // WiFiPcap *wpcap = (WiFiPcap*)malloc(keepLength + sizeof(WiFiPcap));
+            //
+            // Allocate room for the synthetic Radiotap header plus the captured
+            // 802.11 frame bytes.
+            const size_t dot11CaptureLength = (size_t)keepLength;
+            const size_t dot11PacketLength = (size_t)length;
+            const size_t pcapPayloadLength = RADIOTAP_BASIC_LENGTH + dot11CaptureLength;
+            WiFiPcap *wpcap = (WiFiPcap*)malloc(pcapPayloadLength + sizeof(WiFiPcap));
             if (wpcap) {
-                // Make a copy of received packet
-                memcpy(wpcap->payload, snoop->payload, keepLength);
+                // Original:
+                // memcpy(wpcap->payload, snoop->payload, keepLength);
+                //
+                // Prepend Radiotap metadata from rx_ctrl, then copy the original
+                // 802.11 frame immediately after it.
+                fillRadiotapHeader((RadiotapHeaderBasic*)wpcap->payload, &snoop->rx_ctrl, cust_fltr.fcslen);
+                memcpy(&wpcap->payload[RADIOTAP_BASIC_LENGTH], snoop->payload, dot11CaptureLength);
                 /*
                   Prepare pcap packet header
                 */
@@ -904,8 +1060,14 @@ esp_err_t serial_pcap_cb(void *recv_buf, wifi_promiscuous_pkt_type_t type) {
                 //   seconds = snoop->rx_ctrl.timestamp / 1000000u;
                 //   microseconds = snoop->rx_ctrl.timestamp % 1000000u;
                 wpcap->pcap_header.microseconds = snoop->rx_ctrl.timestamp;
-                wpcap->pcap_header.capture_length = keepLength;
-                wpcap->pcap_header.packet_length = length;
+                // Original:
+                // wpcap->pcap_header.capture_length = keepLength;
+                // wpcap->pcap_header.packet_length = length;
+                //
+                // PCAP lengths must include the Radiotap header because it is now
+                // part of the captured packet data presented to decoders.
+                wpcap->pcap_header.capture_length = pcapPayloadLength;
+                wpcap->pcap_header.packet_length = RADIOTAP_BASIC_LENGTH + dot11PacketLength;
 
                 // Queue Wireshark/pcap ready packet
                 // Allow brief blocking - WIFIPCAP_HP_PROCESS_PACKET_TIMEOUT_MS
@@ -1005,7 +1167,10 @@ esp_err_t serial_pcap_start(SERIAL_INF* pcapSerial, bool init_custom_filter) {
         CONFIG_WIFIPCAP_TASK_STACK_SIZE, // uint32_t, Stack size in bytes (4 byte increments)
         session,                         // void *, Task input parameter
         CONFIG_WIFIPCAP_TASK_PRIORITY,   // 2 - UBaseType_t , Priority of the task
-        (void**)&session->task);         // TaskHandle_t *, Task handle
+        // session->task is already a TaskHandle_t, so pass its address directly.
+        // The old void** cast hid a type mismatch caused by making the handle volatile.
+        // (void**)&session->task);         // TaskHandle_t *, Task handle
+        &session->task);                 // TaskHandle_t *, Task handle
 #else
     // Linux appears to drop key-strokes when the USB CDC is busy with
     // Wireshark.
@@ -1019,7 +1184,10 @@ esp_err_t serial_pcap_start(SERIAL_INF* pcapSerial, bool init_custom_filter) {
         CONFIG_WIFIPCAP_TASK_STACK_SIZE, // uint32_t, Stack size in bytes (4 byte increments)
         session,                         // void *, Task input parameter
         CONFIG_WIFIPCAP_TASK_PRIORITY,   // 2 - UBaseType_t , Priority of the task
-        (void**)&session->task,          // TaskHandle_t *, Task handle
+        // Same as the unpinned task path: session->task is a TaskHandle_t, so
+        // pass &session->task directly instead of casting through void**.
+        // (void**)&session->task,          // TaskHandle_t *, Task handle
+        &session->task,                  // TaskHandle_t *, Task handle
         // PRO_CPU_NUM);                   // BaseType_t, Core where the task should run
         APP_CPU_NUM);                    // BaseType_t, Core where the task should run
 #endif
