@@ -32,6 +32,7 @@ import sys
 import argparse
 import textwrap
 import locale
+from datetime import datetime
 
 import serial
 import io
@@ -61,6 +62,53 @@ docs_url = f"https://github.com/mhightower83/{esp32_name}/wiki"
 # https://en.wikipedia.org/wiki/List_of_WLAN_channels#endnote_B
 # max_channel = 13    # North America - permitted with channels 12 & 13 at low power
 max_channel = 11    # North America - more common range
+
+# Wait for the binary PCAP header after passthrough before opening Wireshark.
+pcap_start_timeout = 3.0
+
+# Known PCAP global-header byte orders let us distinguish capture bytes from
+# ESP32 diagnostic text on a noisy USB CDC transition.
+pcap_magic_prefixes = (
+    b'\xd4\xc3\xb2\xa1',  # little-endian microsecond PCAP
+    b'\xa1\xb2\xc3\xd4',  # big-endian microsecond PCAP
+    b'\x4d\x3c\xb2\xa1',  # little-endian nanosecond PCAP
+    b'\xa1\xb2\x3c\x4d',  # big-endian nanosecond PCAP
+)
+
+
+# Returns the first PCAP header offset in a mixed text/binary buffer.
+def findPcapMagic(data):
+    positions = [data.find(magic) for magic in pcap_magic_prefixes]
+    positions = [position for position in positions if position >= 0]
+    return min(positions) if positions else -1
+
+
+# Tee command-line output to both the terminal and an optional per-run log.
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
+
+# Create a fresh log for every CLI or GUI run; never append to old captures.
+def openRunLog(kind):
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    path = os.path.join(log_dir, f"esp32shark-{kind}-{timestamp}.log")
+    return open(path, "w", encoding="utf-8", buffering=1), path
+
 
 # not using - keeping this for now
 # retrieve *system* encoding, not the one used by python internally
@@ -140,6 +188,8 @@ def parseArgs():
     parser.add_argument('--zc', dest='channel', type=int, choices=range(1, 15), required=False, default=None, help=argparse.SUPPRESS)   # debug
     parser.add_argument('--testing', '--test', '-t', action='store_true', default=None, help="Test run - It does everything but start Wireshark.")
     parser.add_argument('--gui', action='store_true', default=False, help='Start a small Tkinter control window instead of launching capture immediately.')
+    # Logging is explicit so --gui remains screen-only unless requested.
+    parser.add_argument('--log', action='store_true', default=False, help='Write this run to a fresh timestamped log file in extras/logs/.')
 
 
     group2 = parser.add_mutually_exclusive_group(required=False)
@@ -322,6 +372,45 @@ def connectESP32(port, channel, filter, unicast, multicast, time_sync):
         """
         return line.rstrip(b'\r\n').decode(errors='backslashreplace')
 
+    # Find the byte after a marker line so trailing binary data can be preserved.
+    def findAfterLine(data, start):
+        cursor = start
+        while cursor < len(data) and data[cursor] != ord('\n'):
+            cursor += 1
+        if cursor < len(data):
+            cursor += 1
+        return cursor
+
+    # Replacement for immediately starting Wireshark after <<PASSTHROUGH>>:
+    # wait until the stream is aligned at the PCAP global header.
+    def waitForPcapStart(buffered=b''):
+        buffer = bytearray(buffered)
+        deadline = time.monotonic() + pcap_start_timeout
+        old_timeout = ser.timeout
+        ser.timeout = 0.05
+        try:
+            while time.monotonic() < deadline:
+                pcap_index = findPcapMagic(buffer)
+                if pcap_index >= 0:
+                    prefix = bytes(buffer[:pcap_index])
+                    if prefix.strip():
+                        # Keep transition noise visible in logs while dropping
+                        # it from the bytes sent to Wireshark.
+                        print(f'[>] ESP32 -> "{serialLineText(prefix)}"')
+                        print("[!] Ignoring non-PCAP bytes before PCAP header.")
+                    return bytes(buffer[pcap_index:])
+
+                chunk = ser.read(4096)
+                if chunk:
+                    buffer.extend(chunk)
+
+            if buffer.strip():
+                print(f'[>] ESP32 -> "{serialLineText(bytes(buffer))}"')
+            print("[!] Timed out waiting for PCAP header after passthrough.")
+            return None
+        finally:
+            ser.timeout = old_timeout
+
     retry = 3
     canBreak = False
     while not canBreak:
@@ -405,6 +494,8 @@ def connectESP32(port, channel, filter, unicast, multicast, time_sync):
     ser.flush()
     print("[<] ESP32 <- {}".format(cmd))
 
+    # Bytes consumed while finding the PCAP header must be replayed to Wireshark.
+    initial_pcap = b''
     while True:
         try:
             line = ser.readline()
@@ -414,20 +505,42 @@ def connectESP32(port, channel, filter, unicast, multicast, time_sync):
             print("[!] Serial port connection closed/failed while reading port!")
             return None
 
+        # Modified from the old unconditional line print: first split the marker
+        # line from any binary tail, then wait for PCAP alignment.
+        if b"<<PASSTHROUGH>>" in line:
+            passthrough_index = line.find(b"<<PASSTHROUGH>>")
+            after_token = passthrough_index + len(b"<<PASSTHROUGH>>")
+            after_line = findAfterLine(line, after_token)
+            print(f'[>] ESP32 -> "{serialLineText(line[:after_line])}"')
+            print("[+] Upload Complete ...")
+            initial_pcap = waitForPcapStart(line[after_line:])
+            if initial_pcap is None:
+                return None
+            break
+
+        # Recovery path for dropped/truncated PASSTHROUGH text: valid PCAP data
+        # is authoritative once the global header appears.
+        pcap_index = findPcapMagic(line)
+        if pcap_index >= 0:
+            text_prefix = line[:pcap_index]
+            if text_prefix.strip():
+                print(f'[>] ESP32 -> "{serialLineText(text_prefix)}"')
+            print("[!] PASSTHROUGH marker was not seen before PCAP data; continuing from PCAP header.")
+            initial_pcap = line[pcap_index:]
+            break
+
         # print(f'[>] ESP32 -> "{line.decode()[:-1]}"')
         print(f'[>] ESP32 -> "{serialLineText(line)}"')
-        if b"<<PASSTHROUGH>>" in line:
-            print("[+] Upload Complete ...")
-            break
 
     print("[+] Stream started ...")
     # Use a short read timeout so the relay loop can notice Wireshark exit and
     # return to the cleanup path that sends EOT back to the ESP32.
     ser.timeout = 0.05
-    return ser
+    # Return the serial object plus any PCAP bytes already consumed by handshake.
+    return ser, initial_pcap
 
 
-def runWireshark(ser):
+def runWireshark(ser, initial_data=b''):
     """
         # Old path gave Wireshark the serial port directly, leaving Python mostly
         # waiting in communicate(). Keep Python in the relay loop so it can detect
@@ -445,6 +558,15 @@ def runWireshark(ser):
     # Wireshark, so this script can detect process exit and close the ESP32 side.
     proc=subprocess.Popen([ wireshark_path, '-k', '-i', '-' ], stdin=subprocess.PIPE)
     try:
+        if initial_data:
+            # Replay PCAP header bytes consumed during handshake before the relay
+            # reads additional serial data.
+            try:
+                proc.stdin.write(initial_data)
+                proc.stdin.flush()
+            except BrokenPipeError:
+                return
+
         while ser.is_open and proc.poll() is None:
             data = ser.read(4096)
             if not data:
@@ -465,7 +587,7 @@ def runWireshark(ser):
         proc.wait()
 
 
-def runWiresharkWin32(ser):
+def runWiresharkWin32(ser, initial_data=b''):
     # Ref. https://wiki.wireshark.org/CaptureSetup/Pipes.md#way-3-python-on-windows
     # Ref. https://stackoverflow.com/a/13319731
     import win32pipe, win32file
@@ -486,6 +608,11 @@ def runWiresharkWin32(ser):
     try:
         win32pipe.ConnectNamedPipe(pipe, None)  # Wait for connection to pipe
         print("[+] Pipe Connected")
+
+        if initial_data:
+            # Keep Windows named-pipe output aligned with the same initial bytes
+            # used by the stdin pipe path.
+            win32file.WriteFile(pipe, initial_data)
 
         while ser.is_open:
             if 0 < ser.in_waiting:
@@ -551,11 +678,27 @@ def runTkinterGui(args):
         print(f"[!] Tkinter is not available: {ex}")
         return 1
 
+    # Start GUI captures in the same filter mode the CLI args requested; when
+    # omitted, default to All for capture/debug visibility.
+    def initialFilterLabel():
+        if args.filter_mask:
+            return "Filter Mask"
+        if args.filter_good:
+            return "Good"
+        if args.filter_session:
+            return "Session"
+        if args.filter_all:
+            return "All"
+        return "All"
+
     class Esp32SharkGui:
         def __init__(self, root):
             self.root = root
             self.proc = None
             self.reader_thread = None
+            # GUI log handles are set per Start only when --log is active.
+            self.log_file = None
+            self.log_path = None
 
             root.title(f"{esp32_name} coPilot")
             root.geometry("720x520")
@@ -563,9 +706,12 @@ def runTkinterGui(args):
 
             self.port_var = tk.StringVar()
             self.channel_var = tk.IntVar(value=args.channel if args.channel else 6)
-            self.filter_var = tk.StringVar(value="Session")
+            # GUI filter controls mirror the CLI mutually exclusive filter group.
+            self.filter_var = tk.StringVar(value=initialFilterLabel())
+            self.filter_mask_var = tk.StringVar(value=args.filter_mask or "mgmt|data")
             self.time_sync_var = tk.BooleanVar(value=args.time_sync)
             self.status_var = tk.StringVar(value="Idle")
+            self.log_path_var = tk.StringVar(value="")
 
             self.build_widgets()
             self.refresh_ports()
@@ -600,13 +746,21 @@ def runTkinterGui(args):
                 controls,
                 textvariable=self.filter_var,
                 state="readonly",
-                values=("Previous", "Session", "Good", "All", "Mgmt + Data", "Bad FCS"))
+                values=("All", "Good", "Session", "Previous", "Filter Mask"))
             self.filter_box.grid(row=2, column=1, sticky=tk.EW, padx=8, pady=8)
+            self.filter_box.bind("<<ComboboxSelected>>", lambda event: self.update_filter_mask_state())
+
+            ttk.Label(controls, text="Filter mask").grid(row=3, column=0, sticky=tk.W, padx=8, pady=8)
+            # The mask field exposes the full --filter_mask grammar instead of
+            # fixed GUI-only presets.
+            self.filter_mask_entry = ttk.Entry(controls, textvariable=self.filter_mask_var)
+            self.filter_mask_entry.grid(row=3, column=1, sticky=tk.EW, padx=8, pady=8)
 
             ttk.Checkbutton(controls, text="Sync PCAP start time from this computer", variable=self.time_sync_var).grid(
-                row=3, column=0, columnspan=3, sticky=tk.W, padx=8, pady=8)
+                row=4, column=0, columnspan=3, sticky=tk.W, padx=8, pady=8)
 
             controls.columnconfigure(1, weight=1)
+            self.update_filter_mask_state()
 
             actions = ttk.Frame(outer)
             actions.pack(fill=tk.X, pady=12)
@@ -622,6 +776,9 @@ def runTkinterGui(args):
                 foreground="#884400")
             note.pack(anchor=tk.W, pady=(0, 8))
 
+            self.log_path_label = ttk.Label(outer, textvariable=self.log_path_var, foreground="#555555")
+            self.log_path_label.pack(anchor=tk.W, pady=(0, 8))
+
             log_frame = ttk.LabelFrame(outer, text="Log")
             log_frame.pack(fill=tk.BOTH, expand=True)
             self.log_text = tk.Text(log_frame, height=14, wrap=tk.WORD)
@@ -633,8 +790,42 @@ def runTkinterGui(args):
             self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         def log(self, message):
-            self.log_text.insert(tk.END, message.rstrip() + "\n")
+            text = message.rstrip()
+            lines = text.splitlines() if text else [""]
+            for line in lines:
+                self.log_text.insert(tk.END, line + "\n")
+                if self.log_file:
+                    # GUI logs include wall-clock stamps because child output can
+                    # interleave with GUI stop/start events.
+                    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    try:
+                        self.log_file.write(f"{stamp} {line}\n")
+                        self.log_file.flush()
+                    except OSError as ex:
+                        failed_log = self.log_file
+                        self.log_file = None
+                        try:
+                            failed_log.close()
+                        except OSError:
+                            pass
+                        self.log_text.insert(tk.END, f"[GUI] Run log write failed: {ex}\n")
+                        break
             self.log_text.see(tk.END)
+
+        # Per-run GUI logs use the shared fresh-log helper and are opt-in.
+        def open_run_log(self):
+            self.log_file, self.log_path = openRunLog("gui")
+            self.log_path_var.set("Run log: " + self.log_path)
+
+        # Close run logs on normal child exit, failed launch, or window close.
+        def close_run_log(self):
+            if not self.log_file:
+                return
+            try:
+                self.log_file.close()
+            except OSError:
+                pass
+            self.log_file = None
 
         def refresh_ports(self):
             ports = sorted(serial.tools.list_ports.comports())
@@ -650,19 +841,27 @@ def runTkinterGui(args):
 
         def filter_args(self):
             selected = self.filter_var.get()
-            if selected == "Previous":
-                return []
-            if selected == "Session":
-                return ["--filter_session"]
-            if selected == "Good":
-                return ["--filter_good"]
+            # Keep GUI filter choices as direct translations to CLI flags.
             if selected == "All":
                 return ["--filter_all"]
-            if selected == "Mgmt + Data":
-                return ["--filter_mask", "mgmt|data"]
-            if selected == "Bad FCS":
-                return ["--filter_mask", "bad"]
+            if selected == "Good":
+                return ["--filter_good"]
+            if selected == "Session":
+                return ["--filter_session"]
+            if selected == "Previous":
+                return []
+            if selected == "Filter Mask":
+                mask = self.filter_mask_var.get().strip()
+                if not mask:
+                    messagebox.showwarning("No Filter Mask", "Enter a filter mask first.")
+                    return None
+                return ["--filter_mask", mask]
             return []
+
+        # The custom-mask entry is meaningful only for --filter_mask.
+        def update_filter_mask_state(self):
+            state = tk.NORMAL if self.filter_var.get() == "Filter Mask" else tk.DISABLED
+            self.filter_mask_entry.configure(state=state)
 
         def build_command(self):
             port = self.port_var.get()
@@ -677,7 +876,11 @@ def runTkinterGui(args):
                 "--channel", str(self.channel_var.get())
             ]
 
-            command.extend(self.filter_args())
+            filter_args = self.filter_args()
+            if filter_args is None:
+                return None
+            # Build the child command from the same syntax users can run by hand.
+            command.extend(filter_args)
 
             if not self.time_sync_var.get():
                 command.append("--no_time_sync")
@@ -693,16 +896,38 @@ def runTkinterGui(args):
             if not command:
                 return
 
+            self.close_run_log()
+            self.log_text.delete("1.0", tk.END)
+            self.log_path = None
+            self.log_path_var.set("")
+            if args.log:
+                # --gui does not write files by itself; --gui --log enables this.
+                try:
+                    self.open_run_log()
+                    self.log("[GUI] Log file: " + self.log_path)
+                except OSError as ex:
+                    self.log("[GUI] Could not create run log: " + str(ex))
+
             self.log("[GUI] Starting: " + " ".join(shlex.quote(part) for part in command))
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
-            self.proc = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env=env)
+            try:
+                # Launch errors should restore UI state instead of bubbling out of
+                # Tkinter callbacks.
+                self.proc = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=env)
+            except OSError as ex:
+                self.log(f"[GUI] Start failed: {ex}")
+                self.status_var.set("Idle")
+                self.start_button.configure(state=tk.NORMAL)
+                self.stop_button.configure(state=tk.DISABLED)
+                self.close_run_log()
+                return
 
             self.status_var.set("Running")
             self.start_button.configure(state=tk.DISABLED)
@@ -712,25 +937,35 @@ def runTkinterGui(args):
             # Tkinter widgets must only be updated on the GUI thread. The reader
             # thread hands each line back to root.after().
             import threading
-            self.reader_thread = threading.Thread(target=self.read_child_output, daemon=True)
+            # Pass the specific process so stale callbacks from an old run cannot
+            # affect a newer capture.
+            self.reader_thread = threading.Thread(target=self.read_child_output, args=(self.proc,), daemon=True)
             self.reader_thread.start()
 
-        def read_child_output(self):
+        def read_child_output(self, proc):
             try:
-                for line in self.proc.stdout:
+                for line in proc.stdout:
                     self.root.after(0, self.log, line)
             except Exception as ex:
                 self.root.after(0, self.log, f"[GUI] Reader stopped: {ex}")
             finally:
-                self.root.after(0, self.child_finished)
+                self.root.after(0, self.child_finished, proc)
 
-        def child_finished(self):
+        def child_finished(self, proc=None):
+            if proc is not None and self.proc is not proc:
+                # Ignore completion callbacks from a previous child process.
+                return
             if self.proc and self.proc.poll() is None:
                 return
 
             self.status_var.set("Idle")
             self.start_button.configure(state=tk.NORMAL)
             self.stop_button.configure(state=tk.DISABLED)
+            return_code = self.proc.returncode if self.proc else None
+            if return_code is not None:
+                self.log(f"[GUI] Child exited with status {return_code}")
+            self.close_run_log()
+            self.proc = None
 
         def stop_capture(self):
             if not self.proc or self.proc.poll() is not None:
@@ -741,18 +976,24 @@ def runTkinterGui(args):
             try:
                 # SIGINT gives the child script a chance to send EOT to the ESP32
                 # and close the serial port cleanly.
-                self.proc.send_signal(signal.SIGINT)
-                self.root.after(2500, self.force_stop_if_needed)
+                proc = self.proc
+                proc.send_signal(signal.SIGINT)
+                # Carry proc into the delayed callback to avoid killing the next
+                # run if the user starts again quickly.
+                self.root.after(2500, self.force_stop_if_needed, proc)
             except Exception as ex:
                 self.log(f"[GUI] Stop failed: {ex}")
 
-        def force_stop_if_needed(self):
-            if self.proc and self.proc.poll() is None:
+        def force_stop_if_needed(self, proc):
+            if self.proc is proc and proc.poll() is None:
+                # This replaces the old global timer that could terminate a newer
+                # child process after a previous run was stopped.
                 self.log("[GUI] Capture did not stop cleanly; terminating child process.")
-                self.proc.terminate()
+                proc.terminate()
 
         def close(self):
             self.stop_capture()
+            self.close_run_log()
             self.root.after(300, self.root.destroy)
 
     root = tk.Tk()
@@ -763,12 +1004,40 @@ def runTkinterGui(args):
 
 def main():
     default_encoding = get_encoding()
+    log_file = None
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+
+    # Restore stdout/stderr on every exit path so --log does not leak process
+    # state into callers or traceback handling.
+    def closeLog():
+        nonlocal log_file
+        if not log_file:
+            return
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        try:
+            log_file.close()
+        except OSError:
+            pass
+        log_file = None
 
     try:
         args = parseArgs()
 
         if args.gui:
             return runTkinterGui(args)
+
+        if args.log:
+            try:
+                # CLI logging is a tee: keep terminal output while recording the
+                # same run to a fresh file.
+                log_file, log_path = openRunLog("cli")
+                sys.stdout = TeeStream(original_stdout, log_file)
+                sys.stderr = TeeStream(original_stderr, log_file)
+                print(f'[+] log           ="{log_path}"')
+            except OSError as ex:
+                print(f"[!] Could not create log: {ex}")
 
         if args.no_addr:
             unicast = [0, 0]
@@ -783,61 +1052,71 @@ def main():
         filter = processFilter(args.filter_mask, args.filter_good, args.filter_all, args.filter_session)
     except:
         print("[+] Exiting ...")
+        # If argument/filter parsing fails after opening a log, close it here.
+        closeLog()
         return 1
-
-    if args.port:
-        port = args.port
-    else:
-        port = pickPort()
-        if not port:
-            print("[+] Exiting ...")
-            return 1
-
-    print(f'[+] port          ="{port}"')
-    print(f'[+] channel       ="{args.channel}"')
-    if filter[0]:
-        print(f'[+] filter_mask   ="{filter[0]:#08x}"')
-    else:
-        print('[+] filter_mask   ="None"')
-
-    if filter[1]:
-        print(f'[+] custom_filter ="{filter[1]:#08x}"')
-    else:
-        print('[+] custom_filter ="None"')
-
-    if unicast:
-        print(f'[+] unicast       ="{unicast}"')
-    # elif oui:
-    #     print(f'[+] --oui="{oui}"')
-
-    if multicast:
-        print(f'[+] multicast     ="{multicast}"')
-
-    print(f'[+] set time      ="{args.time_sync}"')
-    # sys.stdout.flush()
-
-    ser = connectESP32(port, args.channel, filter, unicast, multicast, args.time_sync)
-    if None == ser:
-        print("[+] Exiting ...")
-        return 1
-
-    if not args.testing:
-        system = platform.system()
-        if "Windows" == system:
-            runWiresharkWin32(ser)
-        else:
-            runWireshark(ser)
 
     try:
-        ser.write( b'\x04' )        # send ^D (EOT)
-        ser.flush()
-        ser.dtr = ser.rts = False
-        ser.close()
-    except:
-        pass
+        if args.port:
+            port = args.port
+        else:
+            port = pickPort()
+            if not port:
+                print("[+] Exiting ...")
+                return 1
 
-    print("[+] Done.")
-    return 0
+        print(f'[+] port          ="{port}"')
+        print(f'[+] channel       ="{args.channel}"')
+        if filter[0]:
+            print(f'[+] filter_mask   ="{filter[0]:#08x}"')
+        else:
+            print('[+] filter_mask   ="None"')
+
+        if filter[1]:
+            print(f'[+] custom_filter ="{filter[1]:#08x}"')
+        else:
+            print('[+] custom_filter ="None"')
+
+        if unicast:
+            print(f'[+] unicast       ="{unicast}"')
+        # elif oui:
+        #     print(f'[+] --oui="{oui}"')
+
+        if multicast:
+            print(f'[+] multicast     ="{multicast}"')
+
+        print(f'[+] set time      ="{args.time_sync}"')
+        # sys.stdout.flush()
+
+        connection = connectESP32(port, args.channel, filter, unicast, multicast, args.time_sync)
+        if None == connection:
+            print("[+] Exiting ...")
+            return 1
+        # connectESP32 may consume the PCAP header while aligning the stream, so
+        # pass those bytes into the Wireshark relay.
+        ser, initial_pcap = connection
+
+        if not args.testing:
+            system = platform.system()
+            if "Windows" == system:
+                runWiresharkWin32(ser, initial_pcap)
+            else:
+                runWireshark(ser, initial_pcap)
+
+        try:
+            ser.write( b'\x04' )        # send ^D (EOT)
+            ser.flush()
+            ser.dtr = ser.rts = False
+            ser.close()
+        except:
+            pass
+
+        print("[+] Done.")
+        return 0
+    finally:
+        # Keep the log open through the full capture, then close it on every
+        # normal or early return from the main run path.
+        closeLog()
 
 
 if __name__ == '__main__':
